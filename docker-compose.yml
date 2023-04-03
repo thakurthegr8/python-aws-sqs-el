@@ -1,0 +1,14 @@
+version: '3'
+
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=development
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=AKIAXCDG527HWWV4ODXA
+      - AWS_SECRET_ACCESS_KEY=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
+      - SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/485547169743/local_import_csv_enrichment_batch_list
