@@ -7,9 +7,10 @@ from elasticsearch.exceptions import RequestError
 from dotenv import load_dotenv
 from io import BytesIO, TextIOWrapper
 import pandas as pd
-from utils import OperationType, generate_mapping_from_csv
+from utils import OperationType, generate_mapping_from_csv, get_property_keys, add_data_to_elasticsearch
 from pymongo import MongoClient
 import json
+import re
 
 load_dotenv()
 
@@ -25,9 +26,11 @@ sqs = boto3.client(
 # Get the Elasticsearch host and port from environment variables
 es_host = os.environ.get('ES_HOST', 'elasticsearch')
 es_port = os.environ.get('ES_PORT', '9200')
+es_url = f"http://{es_host}:{es_port}"
+print(es_url)
 
 # Define the Elasticsearch client
-es = Elasticsearch(hosts=[f"http://{es_host}:{es_port}"])
+es = Elasticsearch(hosts=[es_url])
 
 queue_url = os.environ.get('SQS_QUEUE_URL')
 mongodb_url = os.environ.get('MONGO_DB_URL')
@@ -94,98 +97,75 @@ def send_csv_to_sqs(filename):
         response = sqs.send_message(QueueUrl=queue_url, MessageBody=str(rows))
         print(response['MessageId'])
 
-@app.route('/upload', methods=['POST'])
+@app.route('/upload_data', methods=['POST'])
 def upload():
     try:
+        body = request.data
+        # convert the bytes object to a string
+        body_str = body.decode('utf-8')
+        # convert the string to a dictionary
+        body_dict = json.loads(body_str)
         # Get request parameters
-        identifier = request.args.get('id')
-        op_type = OperationType[request.args.get('type')]
-        auto_fill = request.args.get('auto_fill')
-
+        op_type = OperationType[body_dict.get('type')]
+        auto_fill = body_dict.get('auto_fill', False)
         # Get the message from the SQS queue
-        message_id = request.form.get('message_id')
-        response = sqs.receive_message(
-                    QueueUrl=queue_url,
-                    AttributeNames=['All'],
-                    MessageAttributeNames=['All'],
-                    MaxNumberOfMessages=1,
-                    WaitTimeSeconds=0,
-                    VisibilityTimeout=0,
-                    AttributeNames=[
-                        'SentTimestamp'
-                    ],
-                    MessageAttributeNames=[
-                        'All'
-                    ],
-                    ReceiveRequestAttemptId='string',
-                    VisibilityTimeout=123,
-                    WaitTimeSeconds=123,
-                    ReceiveMessageWaitTimeSeconds=123,
-                    AttributeName=['message_id'],
-                    AttributeValue=[message_id]
-                )
+        message_id = body_dict.get('message_id')
+        response = sqs.receive_message(QueueUrl=queue_url, MessageAttributeNames=['All'])
         # Extract the CSV file from the message
         message = response.get('Messages', [])
+        if len(message) > 0:
+            message = message[0]    
+            body = message.get('Body',"")
+            receipt_handle = message.get('ReceiptHandle', {})
+            auto_fill = body_dict.get('auto_fill', False)
+            # Define the mapping arrays for each index
+            company_index_name = "primary_company_list_data"
+            company_mapping_array = get_property_keys(company_index_name, es_url)
+            company_filtered_list = [x for x in company_mapping_array if not re.match(r'^[\d@]', x)]
+            primary_record_index_name = "primary_record_list_data"
+            record_mapping_array = get_property_keys(primary_record_index_name, es_url)
+            record_filtered_list = [x for x in record_mapping_array if not re.match(r'^[\d@]', x)]
+            # Define switcher function
+            def create():
+                get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list,es_url)
+                # mongo_db[company_index_name].insert_many(get_records["company_docs"])
+                # mongo_db[primary_record_index_name].insert_many(get_records["record_docs"])
+            def update():
+                for index, data in mapping.items():
+                    for doc in json.loads(data):
+                        doc_id = doc.pop('id')
+                        try:
+                            es_client.update(index=index, id=doc_id, body={'doc': doc})
+                            mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
+                        except RequestError:
+                            pass  # Ignore errors caused by missing documents
 
-        if message:
-            body = message[0].get('Body', {})
-            receipt_handle = message[0].get('ReceiptHandle', {})
-            file = BytesIO(body)
-            file_wrapper = TextIOWrapper(file, encoding='utf-8')
-            index_name = request.form['index_name']
-            operation_type = OperationType(request.form.get('type', OperationType.CREATE.value))
-            auto_fill = request.form.get('auto_fill', False)
+            def create_or_update():
+                for index, data in mapping.items():
+                    for doc in json.loads(data):
+                        doc_id = doc.pop('id')
+                        try:
+                            es_client.update(index=index, id=doc_id, body={'doc': doc})
+                            mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
+                        except RequestError:
+                            es_client.index(index=index, id=doc_id, body=doc)
+                            mongo_db[index].insert_one(doc)
 
-            # Generate the mapping object for the Elasticsearch index
-            mapping = generate_mapping_from_csv(file_wrapper, index_name)
+            # Call switcher function based on operation type
+            switcher = {
+                OperationType.CREATE: create,
+                OperationType.UPDATE: create,
+                OperationType.UPSERT: create,
+            }
+            switcher[op_type]()
 
-            if mapping:
-                # Create indices if they do not exist
-                for index, index_mapping in mapping.items():
-                    if not es_client.indices.exists(index):
-                        es_client.indices.create(index=index, body=index_mapping)
+            # Return success response
+            return {'message': 'Data uploaded successfully.'}
+
+    except Exception as e:
+        # Return error response
+        return {'message': str(e)}, 500
                 
-                # Define switcher function
-                def create():
-                    for index, data in mapping.items():
-                        es_client.index(index=index, body=json.loads(data))
-                        mongo_db[index].insert_one(json.loads(data))
-
-                def update():
-                    for index, data in mapping.items():
-                        for doc in json.loads(data):
-                            doc_id = doc.pop('id')
-                            try:
-                                es_client.update(index=index, id=doc_id, body={'doc': doc})
-                                mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
-                            except RequestError:
-                                pass  # Ignore errors caused by missing documents
-
-                def create_or_update():
-                    for index, data in mapping.items():
-                        for doc in json.loads(data):
-                            doc_id = doc.pop('id')
-                            try:
-                                es_client.update(index=index, id=doc_id, body={'doc': doc})
-                                mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
-                            except RequestError:
-                                es_client.index(index=index, id=doc_id, body=doc)
-                                mongo_db[index].insert_one(doc)
-
-                # Call switcher function based on operation type
-                switcher = {
-                    OperationType.CREATE: create,
-                    OperationType.UPDATE: update,
-                    OperationType.CREATE_OR_UPDATE: create_or_update,
-                }
-                switcher[op_type]()
-
-                # Return success response
-                return {'message': 'Data uploaded successfully.'}
-
-            except Exception as e:
-                # Return error response
-                return {'message': str(e)}, 500
 
 
 if __name__ == '__main__':
