@@ -7,7 +7,7 @@ from elasticsearch.exceptions import RequestError
 from dotenv import load_dotenv
 from io import BytesIO, TextIOWrapper
 import pandas as pd
-from utils import OperationType, generate_mapping_from_csv, get_property_keys, add_data_to_elasticsearch
+from utils import OperationType, generate_mapping_from_csv, get_property_keys, add_data_to_elasticsearch, update_index_docs, csv_to_json
 from pymongo import MongoClient
 import json
 import re
@@ -127,18 +127,13 @@ def upload():
             record_filtered_list = [x for x in record_mapping_array if not re.match(r'^[\d@]', x)]
             # Define switcher function
             def create():
-                get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list,es_url)
+                get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list,es_url, True)
                 # mongo_db[company_index_name].insert_many(get_records["company_docs"])
                 # mongo_db[primary_record_index_name].insert_many(get_records["record_docs"])
             def update():
-                for index, data in mapping.items():
-                    for doc in json.loads(data):
-                        doc_id = doc.pop('id')
-                        try:
-                            es_client.update(index=index, id=doc_id, body={'doc': doc})
-                            mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
-                        except RequestError:
-                            pass  # Ignore errors caused by missing documents
+                get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list,es_url, False)
+                print(type(get_records["company_docs"]), "type-----")
+                update_index_docs(get_records["company_docs"], "primary_company_list_data", "company_website", "company_website.keyword", es_url)
 
             def create_or_update():
                 for index, data in mapping.items():
@@ -154,7 +149,7 @@ def upload():
             # Call switcher function based on operation type
             switcher = {
                 OperationType.CREATE: create,
-                OperationType.UPDATE: create,
+                OperationType.UPDATE: update,
                 OperationType.UPSERT: create,
             }
             switcher[op_type]()

@@ -61,7 +61,7 @@ def get_property_keys(index_name,  es_url):
     # Return the property keys
     return property_keys[0]
 
-def add_data_to_elasticsearch(file, company_mapping_array, record_mapping_array, hosts):
+def add_data_to_elasticsearch(file, company_mapping_array, record_mapping_array, hosts, isExecute=True):
     # Connect to Elasticsearch
     es = Elasticsearch(hosts=[hosts])
 
@@ -73,7 +73,6 @@ def add_data_to_elasticsearch(file, company_mapping_array, record_mapping_array,
 
     # Convert list of dictionaries to a JSON array
     json_data = json.dumps(list_of_dicts) 
-    print(json_data) 
     company_docs = []
     record_docs = []
     # Parse the JSON data and insert it into Elasticsearch
@@ -91,8 +90,56 @@ def add_data_to_elasticsearch(file, company_mapping_array, record_mapping_array,
         
         company_docs.append(company_document)
         record_docs.append(record_document)
+        if isExecute: 
+            es.index(index='primary_company_list_data', body=(company_document))
+            es.index(index='primary_record_list_data', body=(record_document))
+    return { 'company_docs': company_docs, 'record_docs': record_docs }
 
-        es.index(index='primary_company_list_data', body=transform_date_string(company_document))
-        es.index(index='primary_record_list_data', body=transform_date_string(record_document))
+def csv_to_json(csv_string):
+    csv_data = csv.reader(csv_string.splitlines())
+    headers = next(csv_data)
+    json_list = []
+    for row in csv_data:
+        json_list.append(dict(zip(headers, row)))
+    json_string = json.dumps(json_list)
+    return json.loads(json_string)
 
-    return { company_docs, record_docs }
+def update_index_docs(data, index_name, check_for_field, search_field, hosts):
+    client = Elasticsearch(hosts=[hosts])
+    print(data, "=------data-------")
+
+    for obj in data:
+        check_for_value = obj[check_for_field]
+        check_for_record = client.search(
+            index=index_name,
+            body={
+                'query': {
+                    'bool': {
+                        'filter': [
+                            { 'term': { search_field: check_for_value }}
+                        ]
+                        
+                    }
+                }
+            },
+            size=1
+        )
+        print(json.dumps(check_for_record))
+
+        if check_for_record['hits']['total']['value'] > 0:
+            doc_id = check_for_record['hits']['hits'][0]['_id']
+            result = client.update(
+                index=index_name,
+                id=doc_id,
+                body={
+                    "doc": obj
+                }
+            )
+        else:
+            result = {
+                "message": f"No documents found for {check_for_field}={check_for_value} and {search_field}={check_for_value}"
+            }
+
+        print(json.dumps(result, indent=4))
+
+
