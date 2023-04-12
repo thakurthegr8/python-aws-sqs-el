@@ -112,51 +112,71 @@ def upload():
         message_id = body_dict.get('message_id')
         response = sqs.receive_message(QueueUrl=queue_url, MessageAttributeNames=['All'])
         # Extract the CSV file from the message
-        message = response.get('Messages', [])
-        if len(message) > 0:
-            message = message[0]    
-            body = message.get('Body',"")
-            receipt_handle = message.get('ReceiptHandle', {})
-            auto_fill = body_dict.get('auto_fill', False)
-            # Define the mapping arrays for each index
-            company_index_name = "primary_company_list_data"
-            company_mapping_array = get_property_keys(company_index_name, es_url)
-            company_filtered_list = [x for x in company_mapping_array if not re.match(r'^[\d@]', x)]
-            primary_record_index_name = "primary_record_list_data"
-            record_mapping_array = get_property_keys(primary_record_index_name, es_url)
-            record_filtered_list = [x for x in record_mapping_array if not re.match(r'^[\d@]', x)]
-            # Define switcher function
-            def create():
-                get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list,es_url, True)
+        # Check if there are any messages in the queue
+        messages = response.get('Messages')
+        if not messages:
+            return {'message': 'No messages in the queue.'}
+
+        # Process the first message
+        message = messages[0]
+        body = message.get('Body', '')
+        receipt_handle = message.get('ReceiptHandle', {})
+        auto_fill = body_dict.get('auto_fill', False)
+
+        # Define the mapping arrays for each index
+        company_index_name = "primary_company_list_data"
+        company_mapping_array = get_property_keys(company_index_name, es_url)
+        company_filtered_list = [x for x in company_mapping_array if not re.match(r'^[\d@]', x)]
+        primary_record_index_name = "primary_record_list_data"
+        record_mapping_array = get_property_keys(primary_record_index_name, es_url)
+        record_filtered_list = [x for x in record_mapping_array if not re.match(r'^[\d@]', x)]
+
+        # Define switcher function
+        def create():
+            get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list, es_url, True)
+            if(get_records.get('success', False)):
                 # mongo_db[company_index_name].insert_many(get_records["company_docs"])
                 # mongo_db[primary_record_index_name].insert_many(get_records["record_docs"])
-            def update():
-                get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list,es_url, False)
-                print(type(get_records["company_docs"]), "type-----")
-                update_index_docs(get_records["company_docs"], "primary_company_list_data", "company_website", "company_website.keyword", es_url)
+                sqs.delete_message(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=receipt_handle
+                )
 
-            def create_or_update():
-                for index, data in mapping.items():
-                    for doc in json.loads(data):
-                        doc_id = doc.pop('id')
-                        try:
-                            es_client.update(index=index, id=doc_id, body={'doc': doc})
-                            mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
-                        except RequestError:
-                            es_client.index(index=index, id=doc_id, body=doc)
-                            mongo_db[index].insert_one(doc)
+        def update():
+            get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list, es_url, False)
+            if all([
+                    update_index_docs(get_records["company_docs"], company_index_name, "company_website", "company_website.keyword", es_url),
+                    update_index_docs(get_records["record_docs"], primary_record_index_name, "email", "email.keyword", es_url)
+            ]):
+                sqs.delete_message(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=receipt_handle
+                )
 
-            # Call switcher function based on operation type
-            switcher = {
-                OperationType.CREATE: create,
-                OperationType.UPDATE: update,
-                OperationType.UPSERT: create,
-            }
-            switcher[op_type]()
 
-            # Return success response
-            return {'message': 'Data uploaded successfully.'}
 
+
+        def create_or_update():
+            for index, data in mapping.items():
+                for doc in json.loads(data):
+                    doc_id = doc.pop('id')
+                    try:
+                        es_client.update(index=index, id=doc_id, body={'doc': doc})
+                        mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
+                    except RequestError:
+                        es_client.index(index=index, id=doc_id, body=doc)
+                        mongo_db[index].insert_one(doc)
+
+        # Call switcher function based on operation type
+        switcher = {
+            OperationType.CREATE: create,
+            OperationType.UPDATE: update,
+            OperationType.UPSERT: create,
+        }
+        switcher[op_type]()
+        # Return success response
+        return {'message': 'Data uploaded successfully.'}
+            
     except Exception as e:
         # Return error response
         return {'message': str(e)}, 500

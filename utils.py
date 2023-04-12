@@ -6,11 +6,26 @@ from elasticsearch import Elasticsearch
 import re
 import os
 from datetime import datetime
+from dateutil import parser
 
 # Function to transform the date string to ISO format
-def transform_date_string(obj):
-    obj["email_verification_updated_at"] = datetime.strptime(obj["email_verification_updated_at"], '%m/%d/%Y %H:%M').isoformat()
-    return obj
+def parse_date(date_string, date_format):
+    try:
+        dt_obj = datetime.strptime(date_string, date_format)
+    except ValueError:
+        # try parsing with an alternate format
+        try:
+            dt_obj = datetime.strptime(date_string, '%m/%d/%Y %H:%M')
+            date_format = '%m/%d/%Y %H:%M'
+        except ValueError:
+            # couldn't parse with either format
+            raise ValueError(f"Could not parse date string {date_string} with format {date_format}")
+    
+    formatted_date = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+    
+    return formatted_date
+
+
 
 class OperationType(Enum):
     CREATE = "CREATE"
@@ -45,6 +60,26 @@ def generate_mapping_from_csv(file, index_name):
     }
 
     return mapping
+
+
+def guess_date_format(date_string):
+    formats = ['%Y-%m-%d %H:%M:%S', '%m/%d/%Y %H:%M:%S', '%d/%m/%Y %H:%M:%S',
+               '%Y-%m-%d %H:%M', '%m/%d/%Y %H:%M', '%d/%m/%Y %H:%M',
+               '%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y',
+               '%Y/%m/%d %H:%M:%S', '%Y/%m/%d %H:%M', '%Y/%m/%d',
+               '%d-%m-%Y %H:%M:%S', '%d-%m-%Y %H:%M', '%d-%m-%Y',
+               '%Y.%m.%d %H:%M:%S', '%Y.%m.%d %H:%M', '%Y.%m.%d',
+               "%Y-%m-%d %H:%M:%S","%m/%d/%Y %H:%M:%S","%m/%d/%Y %H:%M",
+                "%m/%d/%y %H:%M:%S","%m/%d/%y %H:%M"]
+
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_string, fmt)
+            return fmt
+        except ValueError:
+            pass
+
+    return None
 
 
 def get_property_keys(index_name,  es_url):
@@ -91,9 +126,11 @@ def add_data_to_elasticsearch(file, company_mapping_array, record_mapping_array,
         company_docs.append(company_document)
         record_docs.append(record_document)
         if isExecute: 
+            company_document['email_verification_updated_at'] = datetime.now()
+            record_document['email_verification_updated_at'] = datetime.now()
             es.index(index='primary_company_list_data', body=(company_document))
             es.index(index='primary_record_list_data', body=(record_document))
-    return { 'company_docs': company_docs, 'record_docs': record_docs }
+    return { 'company_docs': company_docs, 'record_docs': record_docs, 'success': True }
 
 def csv_to_json(csv_string):
     csv_data = csv.reader(csv_string.splitlines())
@@ -105,41 +142,51 @@ def csv_to_json(csv_string):
     return json.loads(json_string)
 
 def update_index_docs(data, index_name, check_for_field, search_field, hosts):
-    client = Elasticsearch(hosts=[hosts])
-    print(data, "=------data-------")
-
-    for obj in data:
-        check_for_value = obj[check_for_field]
-        check_for_record = client.search(
-            index=index_name,
-            body={
-                'query': {
-                    'bool': {
-                        'filter': [
-                            { 'term': { search_field: check_for_value }}
-                        ]
-                        
-                    }
-                }
-            },
-            size=1
-        )
-        print(json.dumps(check_for_record))
-
-        if check_for_record['hits']['total']['value'] > 0:
-            doc_id = check_for_record['hits']['hits'][0]['_id']
-            result = client.update(
+    try:
+        client = Elasticsearch(hosts=[hosts])
+        for obj in data:
+            check_for_value = obj[check_for_field]
+            check_for_record = client.search(
                 index=index_name,
-                id=doc_id,
                 body={
-                    "doc": obj
-                }
+                    'query': {
+                        'bool': {
+                            'filter': [
+                                { 'term': { search_field: check_for_value }}
+                            ]
+                            
+                        }
+                    }
+                },
+                size=1
             )
-        else:
-            result = {
-                "message": f"No documents found for {check_for_field}={check_for_value} and {search_field}={check_for_value}"
-            }
+            if check_for_record['hits']['total']['value'] > 0:
+                old_record = check_for_record['hits']['hits'][0]['_source']
+                if obj['email_verification_updated_at'] != '' and old_record['email_verification_updated_at'] != '':
+                    index_df = guess_date_format(old_record['email_verification_updated_at'])
+                    print(index_df, 'index_df')
+                    obj['email_verification_updated_at'] = parse_date(obj['email_verification_updated_at'], index_df)
+                del obj['email_verification_updated_at']
+                doc_id = check_for_record['hits']['hits'][0]['_id']
+                result = client.update(
+                    index=index_name,
+                    id=doc_id,
+                    body={
+                        "doc": obj
+                    }
+                )
+            else:
+                result = {
+                    "message": f"No documents found for {check_for_field}={check_for_value} and {search_field}={check_for_value}"
+                }
 
-        print(json.dumps(result, indent=4))
+            print(json.dumps(result, indent=4))
+        # Return True if everything is successful
+        return True
+    
+    except Exception as e:
+        # Print the error message and return False if there's an error
+        print(f"Error occurred: {str(e)}")
+        return False
 
 
