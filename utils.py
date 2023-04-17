@@ -189,4 +189,50 @@ def update_index_docs(data, index_name, check_for_field, search_field, hosts):
         print(f"Error occurred: {str(e)}")
         return False
 
+def upsert_index_docs(data, index_name, check_for_field, search_field, hosts):
+    try:
+        client = Elasticsearch(hosts=[hosts])
+        for obj in data:
+            check_for_value = obj[check_for_field]
+            check_for_record = client.search(
+                index=index_name,
+                body={
+                    'query': {
+                        'bool': {
+                            'filter': [
+                                { 'term': { search_field: check_for_value }}
+                            ]
+                            
+                        }
+                    }
+                },
+                size=1
+            )
+            if check_for_record['hits']['total']['value'] > 0:
+                old_record = check_for_record['hits']['hits'][0]['_source']
+                if obj['email_verification_updated_at'] != '' and old_record['email_verification_updated_at'] != '':
+                    index_df = guess_date_format(old_record['email_verification_updated_at'])
+                    print(index_df, 'index_df')
+                    obj['email_verification_updated_at'] = parse_date(obj['email_verification_updated_at'], index_df)
+                del obj['email_verification_updated_at']
+                doc_id = check_for_record['hits']['hits'][0]['_id']
+                result = client.update(
+                    index=index_name,
+                    id=doc_id,
+                    body={
+                        "doc": obj
+                    }
+                )
+            else:
+                client.index(index=index_name, body=(obj))
+
+            print(json.dumps(result, indent=4))
+        # Return True if everything is successful
+        return True
+    
+    except Exception as e:
+        # Print the error message and return False if there's an error
+        print(f"Error occurred: {str(e)}")
+        return False
+
 

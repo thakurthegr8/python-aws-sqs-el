@@ -7,7 +7,7 @@ from elasticsearch.exceptions import RequestError
 from dotenv import load_dotenv
 from io import BytesIO, TextIOWrapper
 import pandas as pd
-from utils import OperationType, generate_mapping_from_csv, get_property_keys, add_data_to_elasticsearch, update_index_docs, csv_to_json
+from utils import OperationType, generate_mapping_from_csv, get_property_keys, add_data_to_elasticsearch, update_index_docs, csv_to_json,upsert_index_docs
 from pymongo import MongoClient
 import json
 import re
@@ -157,15 +157,15 @@ def upload():
 
 
         def create_or_update():
-            for index, data in mapping.items():
-                for doc in json.loads(data):
-                    doc_id = doc.pop('id')
-                    try:
-                        es_client.update(index=index, id=doc_id, body={'doc': doc})
-                        mongo_db[index].update_one({'id': doc_id}, {'$set': doc})
-                    except RequestError:
-                        es_client.index(index=index, id=doc_id, body=doc)
-                        mongo_db[index].insert_one(doc)
+            get_records = add_data_to_elasticsearch(body, company_filtered_list, record_filtered_list, es_url, False)
+            if all([
+                    upsert_index_docs(get_records["company_docs"], company_index_name, "company_website", "company_website.keyword", es_url),
+                    upsert_index_docs(get_records["record_docs"], primary_record_index_name, "email", "email.keyword", es_url)
+            ]):
+                sqs.delete_message(
+                    QueueUrl=queue_url,
+                    ReceiptHandle=receipt_handle
+                )
 
         # Call switcher function based on operation type
         switcher = {
